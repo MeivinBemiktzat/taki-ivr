@@ -2,9 +2,13 @@
 const crypto=require('node:crypto');
 const store=require('./storage'),game=require('./game');
 const TTL=0;
-const esc=s=>String(s).replace(/[=&\r\n]/g,' ').replace(/-/g,' ');
-const say=(message,next='menu')=>'id_list_message=t-'+esc(message)+'&go_to_folder=/' + next;
-const read=(message,key,min=1,max=1)=>'read=t-'+esc(message)+','+key+',1,1,'+min+','+max+',no';
+const esc=s=>String(s).replace(/[=&\r\n.\-]/g,' ');
+const say=(message)=>'id_list_message=t-'+esc(message);
+const read=(message,key,min=1,max=1,wait=false)=>{
+ const name=key;
+ const fields=[name,'',max,min,wait?4:20,'Number','no','no','','',1,'Ok','','','no'].join(',');
+ return 'read=t-'+esc(message)+'='+fields;
+};
 const answer=(res,body)=>res.status(200).setHeader('Content-Type','text/plain; charset=utf-8').send(body);
 const input=(q,key)=>q['api_'+key]??q[key]??null;
 function phone(q){return String(q.ApiPhone||q.apiPhone||q.phone||'').replace(/\D/g,'');}
