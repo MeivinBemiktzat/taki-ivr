@@ -96,7 +96,7 @@ async function handle(s,answer,p){
    const color=engine.COLORS[Number(action)-1];
    if(!color)return {error:'בחירת צבע לא חוקית'};
    const i=s.cardIndex;
-   if(!Number.isInteger(i)||!me.hand[i]||me.hand[i].color||!engine.legal(g,me.hand[i]))return {error:'הקלף השתנה. בחרו שוב'};
+   if(!Number.isInteger(i)||!me.hand[i]||me.hand[i].id!==s.cardId||me.hand[i].color||!engine.legal(g,me.hand[i]))return {error:'הקלף השתנה. בחרו שוב'};
    engine.play(g,i,color);g.applied[actionId]=true;return {changed:true};
   }
   return {};
@@ -104,8 +104,9 @@ async function handle(s,answer,p){
  if(result.missing){s.code=null;return ask(s,'המשחק לא נמצא. לפתיחת משחק הקישו 1. להצטרפות הקישו 2','home');}
  if(result.result?.denied){s.code=null;return ask(s,'אינך רשום למשחק. לפתיחת משחק הקישו 1. להצטרפות הקישו 2','home');}
  const g=result.g,me=person(g,p);
+ if(result.result?.duplicate)return prompt(s,g,me);
  if(result.result?.error)return ask(s,result.result.error+'. הקישו 1 להמשך','refresh');
- if(result.result?.choose!==undefined){s.cardIndex=result.result.choose;return ask(s,'בחרו צבע. לאדום 1. לכחול 2. לירוק 3. לצהוב 4','color');}
+ if(result.result?.choose!==undefined){s.cardIndex=result.result.choose;s.cardId=me.hand[s.cardIndex].id;return ask(s,'בחרו צבע. לאדום 1. לכחול 2. לירוק 3. לצהוב 4','color');}
  if(s.step==='action'&&action==='1'&&g.status==='playing'&&engine.current(g).phone===p)return ask(s,'הקישו את מספר הקלף. '+cards(g,me,true),'card',{max:2});
  if(s.step==='action'&&action==='3')return ask(s,'כל הקלפים שלך: '+cards(g,me,true)+'. להמשך הקישו 1','refresh');
  if(s.step==='wait'&&action==='2')return ask(s,'הקלפים שלך: '+cards(g,me,true)+'. להמשך הקישו 1','refresh');
