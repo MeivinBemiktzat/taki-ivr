@@ -75,26 +75,29 @@ async function handle(s,answer,p){
  }
  if(!s.code){s.step='home';return handle(s,'',p);}
  const action=answer;
+ const actionId=crypto.createHash('sha256').update(p+':'+call(s.request||{})+':'+s.param).digest('hex').slice(0,24);
  const result=await updateGame(s.code,g=>{
+  g.applied ||= {};
+  if(g.applied[actionId])return {duplicate:true};
   const me=person(g,p);
   if(!me)return {denied:true};
   if(g.status!=='playing'||engine.current(g).phone!==p)return {};
   if(s.step==='action'){
-   if(action==='2'){if(g.taki)return {error:'יש לסגור את הטאקי לפני לקיחת קלף'};engine.take(g);return {changed:true};}
-   if(action==='4'&&g.taki){engine.closeTaki(g);return {changed:true};}
+   if(action==='2'){if(g.taki)return {error:'יש לסגור את הטאקי לפני לקיחת קלף'};engine.take(g);g.applied[actionId]=true;return {changed:true};}
+   if(action==='4'&&g.taki){engine.closeTaki(g);g.applied[actionId]=true;return {changed:true};}
   }
   if(s.step==='card'){
    const i=Number(action)-1;
    if(!Number.isInteger(i)||i<0||i>=me.hand.length||!engine.legal(g,me.hand[i]))return {error:'קלף לא חוקי'};
    if(!me.hand[i].color)return {choose:i};
-   engine.play(g,i,null);return {changed:true};
+   engine.play(g,i,null);g.applied[actionId]=true;return {changed:true};
   }
   if(s.step==='color'){
    const color=engine.COLORS[Number(action)-1];
    if(!color)return {error:'בחירת צבע לא חוקית'};
    const i=s.cardIndex;
    if(!Number.isInteger(i)||!me.hand[i]||me.hand[i].color||!engine.legal(g,me.hand[i]))return {error:'הקלף השתנה. בחרו שוב'};
-   engine.play(g,i,color);return {changed:true};
+   engine.play(g,i,color);g.applied[actionId]=true;return {changed:true};
   }
   return {};
  });
@@ -120,7 +123,9 @@ module.exports=async function handler(req,res){
     const val=s.param?String(q['api_'+s.param]??q[s.param]??''):'';
     if(old&&s.lastResponse!==null&&val===s.lastValue&&s.lastHandledParam===s.param)return s.lastResponse;
     const previous=s.param;
+    s.request={ApiCallId:call(q)};
     const response=await handle(s,val,p);
+    delete s.request;
     s.lastHandledParam=previous;s.lastValue=val;s.lastResponse=response;
     await store.put(k,s);
     return response;
