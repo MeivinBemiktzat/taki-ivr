@@ -1,28 +1,131 @@
 'use strict';
 const crypto=require('node:crypto');
-const store=require('./storage'),game=require('./game');
-const TTL=0;
-const esc=s=>String(s).replace(/[=&\r\n.\-]/g,' ');
-const say=(message)=>'id_list_message=t-'+esc(message);
-const read=(message,key,min=1,max=1,wait=false)=>{
- const name=key;
- const fields=[name,'',max,min,wait?4:20,'Number','no','no','','',1,'Ok','','','no'].join(',');
- return 'read=t-'+esc(message)+'='+fields;
+const store=require('./storage'),engine=require('./game');
+const clean=s=>String(s??'').replace(/[.=&\r\n-]/g,' ').slice(0,2000);
+const phone=q=>String(q.ApiPhone||q.apiPhone||'').replace(/\D/g,'');
+const call=q=>String(q.ApiCallId||q.apiCallId||q.ApiPhone||'').slice(0,160);
+const sessionKey=q=>'session-'+crypto.createHash('sha256').update(call(q)).digest('hex');
+const gameKey=code=>'game-'+code;
+const params=q=>Object.assign({},q);
+const output=(res,text)=>res.status(200).setHeader('Content-Type','text/plain; charset=utf-8').send(text);
+const speak=t=>'id_list_message=t-'+clean(t);
+function ask(s,t,step,{max=1,min=1,timeout=20}={}){
+ s.step=step;s.seq=(s.seq||0)+1;s.param='P'+s.seq;
+ const fields=[s.param,'',max,min,timeout,'Number','no','no','','',1,'Ok','','','no'].join(',');
+ return 'read=t-'+clean(t)+'='+fields;
+}
+function last(g){return g.log.slice(-2).join('. ');}
+function state(g,p){if(g.status==='finished')return 'המשחק הסתיים. המנצח הוא '+g.winner;
+ if(g.status==='waiting')return 'ממתינים להצטרפות. קוד המשחק '+g.code+'. יש '+g.players.length+' שחקנים מתוך '+g.capacity;
+ return last(g)+'. הקלף העליון '+engine.describe(engine.top(g))+'. הצבע הפעיל '+g.chosenColor+'. '+(engine.current(g).phone===p.phone?'עכשיו התור שלך':'כעת התור של '+engine.current(g).name);
+}
+function cards(g,p,all){const a=p.hand.map((c,i)=>({c,i})).filter(x=>all||engine.legal(g,x.c));return a.length?a.map(x=>'מספר '+(x.i+1)+' '+engine.describe(x.c)).join('. '):'אין קלפים חוקיים';}
+function prompt(s,g,p){
+ if(g.status==='finished')return ask(s,state(g,p)+'. להמשך הקישו 1','finished');
+ if(g.status==='waiting')return ask(s,state(g,p)+'. לרענון הקישו 1','wait',{timeout:5});
+ if(engine.current(g).phone!==p.phone)return ask(s,state(g,p)+'. לרענון הקישו 1. לשמיעת הקלפים שלך הקישו 2','wait',{timeout:5});
+ return ask(s,state(g,p)+'. '+(g.pendingDraw?'יש לקחת '+g.pendingDraw+' קלפים או להניח פלוס שתיים. ':'')+
+ 'קלפים חוקיים: '+cards(g,p,false)+'. להנחת קלף הקישו 1. לקחת קלף הקישו 2. לכל הקלפים הקישו 3. '+(g.taki?'לסגירת טאקי הקישו 4. ':'')+'לרענון הקישו 5','action');
+}
+function person(g,p){return g.players.find(x=>x.phone===p);}
+async function updateGame(code,mutator){
+ for(let attempt=0;attempt<6;attempt++){
+  try{return await store.run(async()=>{const g=await store.get(gameKey(code));if(!g)return {missing:true};
+   const result=mutator(g)||{};if(result.changed){engine.bots(g);g.revision++;await store.put(gameKey(code),g);}
+   return {g,result};
+  });}catch(e){if(e.code!=='CONFLICT'||attempt===5)throw e;}
+ }
+}
+async function newGame(p,mode,count){
+ for(let i=0;i<20;i++){const code=String(crypto.randomInt(1000,10000));
+  try{const g=await store.run(async()=>{if(await store.get(gameKey(code)))return null;
+   const x=engine.create(code,p,mode,mode==='bots'?count-1:0,count);await store.put(gameKey(code),x);return x;});
+   if(g)return g;
+  }catch(e){if(e.code!=='CONFLICT')throw e;}
+ }throw Error('Unable to allocate room');
+}
+async function handle(s,answer,p){
+ if(s.step==='home'){
+  if(answer==='1')return ask(s,'למשחק מול בוטים הקישו 1. למשחק עם שחקנים אחרים הקישו 2','mode');
+  if(answer==='2')return ask(s,'הקישו קוד משחק בן ארבע ספרות','join',{min:4,max:4});
+  return ask(s,'ברוכים הבאים לטאקי הטלפוני. לפתיחת משחק הקישו 1. להצטרפות או חזרה הקישו 2','home');
+ }
+ if(s.step==='mode'){
+  if(!['1','2'].includes(answer))return ask(s,'בחירה לא תקינה. לבוטים 1. לשחקנים אחרים 2','mode');
+  s.mode=answer==='1'?'bots':'humans';return ask(s,'כמה שחקנים כולל אותך? הקישו בין 2 ל 6','count');
+ }
+ if(s.step==='count'){
+  const count=Number(answer);
+  if(!Number.isInteger(count)||count<2||count>6)return ask(s,'הקישו מספר שחקנים בין 2 ל 6','count');
+  const g=await newGame(p,s.mode,count);s.code=g.code;
+  const me=person(g,p);
+  return ask(s,'נוצר חדר. קוד המשחק הוא '+g.code+'. '+state(g,me)+'. להמשך הקישו 1','wait',{timeout:5});
+ }
+ if(s.step==='join'){
+  if(!/^\d{4}$/.test(answer))return ask(s,'הקישו קוד בן ארבע ספרות','join',{min:4,max:4});
+  const result=await updateGame(answer,g=>{
+   if(person(g,p))return {};
+   if(g.status!=='waiting'||g.players.length>=g.capacity)return {denied:true};
+   g.players.push({id:'p'+(g.players.length+1),phone:p,name:'שחקן '+(g.players.length+1),bot:false,hand:[]});
+   if(g.players.length===g.capacity)engine.start(g);
+   return {changed:true};
+  });
+  if(result.missing||result.result?.denied)return ask(s,'החדר אינו זמין. הקישו קוד חדר אחר','join',{min:4,max:4});
+  s.code=answer;return prompt(s,result.g,person(result.g,p));
+ }
+ if(!s.code){s.step='home';return handle(s,'',p);}
+ const action=answer;
+ const result=await updateGame(s.code,g=>{
+  const me=person(g,p);
+  if(!me)return {denied:true};
+  if(g.status!=='playing'||engine.current(g).phone!==p)return {};
+  if(s.step==='action'){
+   if(action==='2'){if(g.taki)return {error:'יש לסגור את הטאקי לפני לקיחת קלף'};engine.take(g);return {changed:true};}
+   if(action==='4'&&g.taki){engine.closeTaki(g);return {changed:true};}
+  }
+  if(s.step==='card'){
+   const i=Number(action)-1;
+   if(!Number.isInteger(i)||i<0||i>=me.hand.length||!engine.legal(g,me.hand[i]))return {error:'קלף לא חוקי'};
+   if(!me.hand[i].color)return {choose:i};
+   engine.play(g,i,null);return {changed:true};
+  }
+  if(s.step==='color'){
+   const color=engine.COLORS[Number(action)-1];
+   if(!color)return {error:'בחירת צבע לא חוקית'};
+   const i=s.cardIndex;
+   if(!Number.isInteger(i)||!me.hand[i]||me.hand[i].color||!engine.legal(g,me.hand[i]))return {error:'הקלף השתנה. בחרו שוב'};
+   engine.play(g,i,color);return {changed:true};
+  }
+  return {};
+ });
+ if(result.missing){s.code=null;return ask(s,'המשחק לא נמצא. לפתיחת משחק הקישו 1. להצטרפות הקישו 2','home');}
+ if(result.result?.denied){s.code=null;return ask(s,'אינך רשום למשחק. לפתיחת משחק הקישו 1. להצטרפות הקישו 2','home');}
+ const g=result.g,me=person(g,p);
+ if(result.result?.error)return ask(s,result.result.error+'. הקישו 1 להמשך','refresh');
+ if(result.result?.choose!==undefined){s.cardIndex=result.result.choose;return ask(s,'בחרו צבע. לאדום 1. לכחול 2. לירוק 3. לצהוב 4','color');}
+ if(s.step==='action'&&action==='1'&&g.status==='playing'&&engine.current(g).phone===p)return ask(s,'הקישו את מספר הקלף. '+cards(g,me,true),'card',{max:2});
+ if(s.step==='action'&&action==='3')return ask(s,'כל הקלפים שלך: '+cards(g,me,true)+'. להמשך הקישו 1','refresh');
+ if(s.step==='wait'&&action==='2')return ask(s,'הקלפים שלך: '+cards(g,me,true)+'. להמשך הקישו 1','refresh');
+ return prompt(s,g,me);
+}
+module.exports=async function handler(req,res){
+ if(!['GET','POST'].includes(req.method))return output(res,'');
+ const q=params({...req.query,...req.body}),p=phone(q);
+ if(!p)return output(res,speak('לא התקבל מספר טלפון מזוהה'));
+ try{
+  for(let attempt=0;attempt<5;attempt++){
+   try{const body=await store.run(async()=>{
+    const k=sessionKey(q),old=await store.get(k);
+    const s=old||{step:'home',seq:0,param:null,code:null,mode:null,cardIndex:null,lastResponse:null,lastValue:null};
+    const val=s.param?String(q['api_'+s.param]??q[s.param]??''):'';
+    if(old&&s.lastResponse!==null&&val===s.lastValue&&s.lastHandledParam===s.param)return s.lastResponse;
+    const previous=s.param;
+    const response=await handle(s,val,p);
+    s.lastHandledParam=previous;s.lastValue=val;s.lastResponse=response;
+    await store.put(k,s);
+    return response;
+   });return output(res,body);
+   }catch(e){if(e.code!=='CONFLICT'||attempt===4)throw e;}
+  }
+ }catch(e){console.error(JSON.stringify({service:'taki-ivr',event:'error',code:e.code||e.name,message:e.message}));return output(res,speak('אירעה תקלה זמנית. נסו שוב'));}
 };
-const answer=(res,body)=>res.status(200).setHeader('Content-Type','text/plain; charset=utf-8').send(body);
-const input=(q,key)=>q['api_'+key]??q[key]??null;
-function phone(q){return String(q.ApiPhone||q.apiPhone||q.phone||'').replace(/\D/g,'');}
-const key=c=>'game-'+c;
-function handText(g,p,all){const list=p.hand.map((c,i)=>({c,i})).filter(x=>all||game.legal(g,x.c));return list.length?list.map(x=>(x.i+1)+': '+game.describe(x.c)).join('. '):'אין קלפים חוקיים';}
-function status(g,p){if(g.status==='finished')return 'המשחק הסתיים. המנצח הוא '+g.winner+'.';if(g.status==='waiting')return 'ממתינים לשחקנים. קוד המשחק '+g.code+'. הצטרפו '+g.players.length+' מתוך '+g.capacity+'.';const last=g.log.slice(-2).join('. ');return last+'. קלף עליון '+game.describe(game.top(g))+'. הצבע הפעיל '+g.chosenColor+'. '+(game.current(g).phone===p.phone?'זה התור שלך. ':'התור של '+game.current(g).name+'. ');}
-function menu(g,p){if(g.status!=='playing')return say(status(g,p));if(game.current(g).phone!==p.phone)return read(status(g,p)+' להתרעננות הקישו 1. לשמיעת היד הקישו 2.','wait',1,1);return read(status(g,p)+' '+(g.pendingDraw?'יש לקחת '+g.pendingDraw+' קלפים או להניח פלוס 2. ':'')+' הקלפים החוקיים: '+handText(g,p,false)+'. להנחת קלף הקישו 1. לקחת קלף הקישו 2. לשמיעת כל הקלפים הקישו 3. '+(g.taki?'לסגירת טאקי הקישו 4. ':'')+' לרענון הקישו 5.','action',1,1);}
-async function mutate(code,fn){for(let attempt=0;attempt<5;attempt++){try{return await store.run(async()=>{const g=await store.get(key(code));if(!g)return null;const result=fn(g);if(result?.changed){game.bots(g);g.revision++;await store.put(key(code),g);}return {g,result};});}catch(e){if(e.code!=='CONFLICT'||attempt===4)throw e;}}}
-module.exports=async function handler(req,res){if(req.method!=='GET'&&req.method!=='POST')return answer(res,'');const q={...req.query,...req.body};const p=phone(q);if(!p)return answer(res,say('לא התקבל זיהוי מספר טלפון.'));try{
-const code=String(q.code||input(q,'room')||'').replace(/\D/g,'').slice(0,4);
-const phase=String(q.phase||'home');
-if(phase==='home'){const v=input(q,'home');if(v==='1')return answer(res,read('משחק חדש. למשחק מול בוטים הקישו 1. למשחק עם חברים הקישו 2.','mode'));if(v==='2')return answer(res,read('הקישו קוד משחק בן ארבע ספרות','room',4,4));if(v==='3')return answer(res,read('הקישו את קוד המשחק לחזרה','room',4,4));return answer(res,read('ברוכים הבאים לטאקי הטלפוני. למשחק חדש הקישו 1. להצטרפות או חזרה למשחק הקישו 2.','home'));}
-if(phase==='create'){const mode=input(q,'mode')==='1'?'bots':'humans';const count=Number(input(q,'count'));if(![2,3,4,5,6].includes(count))return answer(res,read('כמה שחקנים כולל אותך? הקישו מספר בין 2 ל 6','count'));for(let i=0;i<12;i++){const c=String(crypto.randomInt(1000,10000));const result=await store.run(async()=>{const existing=await store.get(key(c));if(existing)return false;const g=game.create(c,p,mode,mode==='bots'?count-1:0,count);await store.put(key(c),g);return true;});if(result)return answer(res,say('נוצר משחק. קוד החדר '+c+'. חייגו שוב ובחרו הצטרפות והקישו את הקוד.'));}return answer(res,say('לא ניתן ליצור חדר כרגע.'));}
-if(phase==='room'){if(!code)return answer(res,read('הקישו קוד משחק בן ארבע ספרות','room',4,4));const out=await mutate(code,g=>{let player=g.players.find(x=>x.phone===p);if(player)return {changed:false};if(g.status!=='waiting'||g.players.length>=g.capacity)return {changed:false,denied:true};player={id:'p'+(g.players.length+1),phone:p,name:'שחקן '+(g.players.length+1),bot:false,hand:[]};g.players.push(player);if(g.players.length===g.capacity)game.start(g);return {changed:true};});if(!out)return answer(res,say('החדר לא נמצא.'));if(out.result.denied)return answer(res,say('לא ניתן להצטרף לחדר.'));return answer(res,say(status(out.g,out.g.players.find(x=>x.phone===p))+' לשמיעת מצב המשחק היכנסו שוב.'));}
-if(phase==='turn'){if(!code)return answer(res,say('חסר קוד משחק'));const act=input(q,'action'),cardNum=Number(input(q,'card')),colorNum=Number(input(q,'color'));const out=await mutate(code,g=>{const player=g.players.find(x=>x.phone===p);if(!player)return {changed:false,denied:true};if(g.status!=='playing'||game.current(g).phone!==p||!act)return {changed:false};if(act==='2'){game.take(g);return {changed:true};}if(act==='4'&&g.taki){game.closeTaki(g);return {changed:true};}if(act==='1'&&Number.isInteger(cardNum)&&cardNum>=1&&cardNum<=player.hand.length){const c=player.hand[cardNum-1];if(!game.legal(g,c))return {changed:false,error:'קלף לא חוקי'};if(!c.color&&!game.COLORS[colorNum-1])return {changed:false,needColor:true};game.play(g,cardNum-1,c.color?null:game.COLORS[colorNum-1]);return {changed:true};}return {changed:false};});if(!out)return answer(res,say('המשחק לא נמצא'));const player=out.g.players.find(x=>x.phone===p);if(!player)return answer(res,say('אינך משתתף בחדר'));if(out.result?.error)return answer(res,say(out.result.error));if(out.result?.needColor)return answer(res,read('בחר צבע. 1 אדום. 2 כחול. 3 ירוק. 4 צהוב.','color'));if(act==='1'&&!cardNum)return answer(res,read('הקישו את מספר הקלף הרצוי. '+handText(out.g,player,true),'card',1,2));return answer(res,menu(out.g,player));}
-return answer(res,read('ברוכים הבאים לטאקי. למשחק חדש הקישו 1. להצטרפות הקישו 2.','home'));
-}catch(e){console.error('taki ivr',e.code||e.name,e.message);return answer(res,say('אירעה תקלה זמנית. נסו שוב.'));}};
